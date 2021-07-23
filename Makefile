@@ -96,10 +96,27 @@ docker-component: check-component
 docker:
 	GOOS=linux GOARCH=amd64 $(MAKE) build
 	cp ./bin/hec-receiver-mock_linux_amd64 ./cmd/hec-receiver-mock/hec-receiver-mock
-	docker build -t hec-receiver-mock:$(VERSION) ./cmd/hec-receiver-mock/
+	docker build -t rock1017/hec-receiver-mock:$(VERSION) ./cmd/hec-receiver-mock/
+	docker image tag rock1017/hec-receiver-mock:$(VERSION) rock1017/hec-receiver-mock:latest
 	rm ./cmd/hec-receiver-mock/hec-receiver-mock
 
-# Build the Collector executable.
 .PHONY: build
 build:
 	GO111MODULE=on CGO_ENABLED=0 go build -trimpath -o ./bin/hec-receiver-mock_$(GOOS)_$(GOARCH)$(EXTENSION)
+
+.PHONY: push
+push:
+	docker push rock1017/hec-receiver-mock:$(VERSION)
+	docker push rock1017/hec-receiver-mock:latest
+
+.PHONY: deploy
+deploy:
+	kubectl delete -f cmd/hec-receiver-mock/k8s_manifests.yaml
+	kubectl apply -f cmd/hec-receiver-mock/k8s_manifests.yaml
+
+.PHONY: setversion
+setversion:
+	yq w -i cmd/hec-receiver-mock/k8s_manifests.yaml 'spec.template.spec.containers(name==hec-receiver-mock).image' rock1017/hec-receiver-mock:$(VERSION)
+
+.PHONY: newdeploy
+newdeploy: docker push deploy

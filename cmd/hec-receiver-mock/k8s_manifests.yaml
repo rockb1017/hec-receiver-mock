@@ -14,7 +14,8 @@ spec:
     spec:
       containers:
         - name: hec-receiver-mock
-          image: rock1017/hec-receiver-mock:0.1.0
+          image: rock1017/hec-receiver-mock:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8088
 ---

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -48,24 +48,48 @@ var (
 	errUnsupportedLogEvent    = initJSONResponse(responseErrUnsupportedLogEvent)
 )
 
+type summaryData struct {
+	Source         string `json:"source"`
+	Eps            string `json:"eps"`
+	EventsReceived int64  `json:"eventsReceived"`
+	Thorughput     string `json:"thorughput"`
+	DataIngestRate string `json:"dataIngestRate"`
+}
+
+type eventSourceStat struct {
+	eventsReceived int64
+	beginTime      time.Time
+	bytesReceived  float64
+	endTime        time.Time
+	generatedCount int64
+}
+
 type splunkReceiver struct {
 	server          *http.Server
 	performanceStat map[string]*eventSourceStat
+	receivedEvents  chan *Event
+	eventCount      int64
+	byteReceived    int64
+	beginTime       time.Time
+	endTime         time.Time
 }
 
-type summaryData struct {
-	Source         string    `json:"source"`
-	Eps            float64   `json:"eps"`
-	EventsReceived int64     `json:"eventsReceived"`
-	Thorughput     float64   `json:"thorughput"`
-	DataIngestRate float64   `json:"dataIngestRate"`
-	BeginTime      time.Time `json:"beginTime"`
-	EndTime        time.Time `json:"endTime"`
+type Event struct {
+	Time       *float64               `json:"time,omitempty"`
+	Host       string                 `json:"host"`
+	Source     string                 `json:"source,omitempty"`
+	SourceType string                 `json:"sourcetype,omitempty"`
+	Index      string                 `json:"index,omitempty"`
+	Event      string                 `json:"event"`
+	Fields     map[string]interface{} `json:"fields,omitempty"`
 }
 
 func NewLogsReceiver() (*splunkReceiver, error) {
 	r := &splunkReceiver{
 		performanceStat: map[string]*eventSourceStat{},
+		receivedEvents:  make(chan *Event),
+		eventCount:      0,
+		byteReceived:    0,
 		server: &http.Server{
 			Addr:              ":8088",
 			ReadHeaderTimeout: defaultServerTimeout,
@@ -77,6 +101,7 @@ func NewLogsReceiver() (*splunkReceiver, error) {
 }
 
 func (r *splunkReceiver) Start() error {
+	go r.consumeEvents()
 	// set up the listener
 	ln, err := net.Listen("tcp", ":8088")
 	if err != nil {
@@ -85,14 +110,12 @@ func (r *splunkReceiver) Start() error {
 
 	mx := mux.NewRouter()
 	mx.HandleFunc("/summary", r.summary)
-	mx.NewRoute().HandlerFunc(r.handleReq)
+	mx.NewRoute().HandlerFunc(r.receiveEvents)
 
 	r.server = &http.Server{
 		Handler: mx,
 	}
 
-	// TODO: Evaluate what properties should be configurable, for now
-	//		set some hard-coded values.
 	r.server.ReadHeaderTimeout = defaultServerTimeout
 	r.server.WriteTimeout = defaultServerTimeout
 
@@ -104,71 +127,71 @@ func (r *splunkReceiver) Start() error {
 	return err
 }
 
-type Event struct {
-	Time       *float64               `json:"time,omitempty"`       // optional epoch time - set to nil if the event timestamp is missing or unknown
-	Host       string                 `json:"host"`                 // hostname
-	Source     string                 `json:"source,omitempty"`     // optional description of the source of the event; typically the app's name
-	SourceType string                 `json:"sourcetype,omitempty"` // optional name of a Splunk parsing configuration; this is usually inferred by Splunk
-	Index      string                 `json:"index,omitempty"`      // optional name of the Splunk index to store the event in; not required if the token has a default index set in Splunk
-	Event      string                 `json:"event"`                // type of event: set to "metric" or nil if the event represents a metric, or is the payload of the event.
-	Fields     map[string]interface{} `json:"fields,omitempty"`     // dimensions and metric data
-}
-
-// UnmarshalJSON unmarshals the JSON representation of an event
-func (e *Event) UnmarshalJSON(b []byte) error {
-	rawEvent := struct {
-		Time       interface{}            `json:"time,omitempty"`
-		Host       string                 `json:"host"`
-		Source     string                 `json:"source,omitempty"`
-		SourceType string                 `json:"sourcetype,omitempty"`
-		Index      string                 `json:"index,omitempty"`
-		Event      string                 `json:"event"`
-		Fields     map[string]interface{} `json:"fields,omitempty"`
-	}{}
-	err := json.Unmarshal(b, &rawEvent)
-	if err != nil {
-		return err
-	}
-	*e = Event{
-		Host:       rawEvent.Host,
-		Source:     rawEvent.Source,
-		SourceType: rawEvent.SourceType,
-		Index:      rawEvent.Index,
-		Event:      rawEvent.Event,
-		Fields:     rawEvent.Fields,
-	}
-	switch t := rawEvent.Time.(type) {
-	case float64:
-		e.Time = &t
-	case string:
-		{
-			time, err := strconv.ParseFloat(t, 64)
-			if err != nil {
-				return err
-			}
-			e.Time = &time
-		}
-	}
-	return nil
-}
-
-func (r *splunkReceiver) handleReq(resp http.ResponseWriter, req *http.Request) {
+func (r *splunkReceiver) receiveEvents(resp http.ResponseWriter, req *http.Request) {
 	if req.ContentLength == 0 {
 		resp.Write(okRespBody)
 		return
 	}
 	dec := json.NewDecoder(req.Body)
-	var events []*Event
 	for dec.More() {
 		var msg Event
 		err := dec.Decode(&msg)
 		if err != nil {
+			log.Println("fail request")
 			r.failRequest(resp, http.StatusBadRequest, errUnmarshalBodyRespBody)
 			return
 		}
-		events = append(events, &msg)
+		r.receivedEvents <- &msg
 	}
-	r.consumeLogs(req.Context(), events, resp, req)
+	resp.WriteHeader(http.StatusAccepted)
+	resp.Write(okRespBody)
+}
+
+func (r *splunkReceiver) consumeEvents() {
+	interval := time.Second * 3
+	timer := time.NewTimer(interval)
+	r.beginTime = time.Now()
+	for {
+		select {
+		case <-timer.C:
+			r.endTime = time.Now()
+			duration := r.endTime.Sub(r.beginTime).Seconds()
+			log.Printf("EPS: %.0f\n", float64(r.eventCount)/duration)
+			log.Printf("Throughput: %.0fk\n", float64(r.eventCount)/duration/1024)
+			r.eventCount = 0
+			r.byteReceived = 0
+			r.beginTime = r.endTime
+			timer.Reset(interval)
+		default:
+		}
+		select {
+		case event := <-r.receivedEvents:
+			r.eventCount += 1
+			r.byteReceived += int64(len(event.Event))
+
+			if _, ok := r.performanceStat[event.Source]; !ok {
+				r.performanceStat[event.Source] = &eventSourceStat{
+					eventsReceived: 0,
+					beginTime:      time.Now(),
+					bytesReceived:  0,
+					endTime:        time.Now(),
+					generatedCount: 1,
+				}
+			}
+			esStat := r.performanceStat[event.Source]
+			esStat.eventsReceived += 1
+			esStat.bytesReceived += float64(len(event.Event))
+			esStat.endTime = time.Now()
+			if event.Event[:9] == "---end---" {
+				generatedCount, err := strconv.ParseInt(strings.TrimSpace(event.Event[10:]), 10, 64)
+				if err != nil {
+					log.Fatalln(err)
+				}
+				esStat.generatedCount = generatedCount
+			}
+		default:
+		}
+	}
 }
 
 func (r *splunkReceiver) calculateStats() *[]summaryData {
@@ -176,12 +199,10 @@ func (r *splunkReceiver) calculateStats() *[]summaryData {
 	for source, stats := range r.performanceStat {
 		sum := summaryData{
 			Source:         source,
-			Eps:            float64(stats.eventsReceived) / stats.endTime.Sub(stats.beginTime).Seconds(),
-			Thorughput:     stats.bytesReceived / 1024 / 1024,
-			DataIngestRate: float64(stats.eventsReceived) / float64(stats.generatedCount),
+			Eps:            fmt.Sprintf("%0.f", float64(stats.eventsReceived)/stats.endTime.Sub(stats.beginTime).Seconds()),
+			Thorughput:     fmt.Sprintf("%0.fk", stats.bytesReceived/1024),
+			DataIngestRate: fmt.Sprintf("%2.f%", float64(stats.eventsReceived)/float64(stats.generatedCount)*100),
 			EventsReceived: stats.eventsReceived,
-			BeginTime:      stats.beginTime,
-			EndTime:        stats.endTime,
 		}
 		result = append(result, sum)
 	}
@@ -191,7 +212,7 @@ func (r *splunkReceiver) calculateStats() *[]summaryData {
 func (r *splunkReceiver) summary(resp http.ResponseWriter, req *http.Request) {
 	resp.Header().Set("Content-Type", "application/json")
 	result := r.calculateStats()
-	js, err := json.Marshal(result)
+	js, err := json.MarshalIndent(result, "", "\t")
 	if err != nil {
 		http.Error(resp, err.Error(), http.StatusInternalServerError)
 		return
@@ -202,42 +223,6 @@ func (r *splunkReceiver) summary(resp http.ResponseWriter, req *http.Request) {
 	if writeErr != nil {
 		log.Println("Error writing HTTP response message", zap.Error(writeErr))
 	}
-}
-
-type eventSourceStat struct {
-	eventsReceived int64
-	beginTime      time.Time
-	bytesReceived  float64
-	endTime        time.Time
-	generatedCount int64
-}
-
-func (r *splunkReceiver) consumeLogs(ctx context.Context, events []*Event, resp http.ResponseWriter, req *http.Request) {
-	for _, event := range events {
-		if _, ok := r.performanceStat[event.Source]; !ok {
-			r.performanceStat[event.Source] = &eventSourceStat{
-				eventsReceived: 0,
-				beginTime:      time.Now(),
-				bytesReceived:  0,
-				endTime:        time.Now(),
-				generatedCount: 1,
-			}
-		}
-		esStat := r.performanceStat[event.Source]
-		esStat.eventsReceived += 1
-		esStat.bytesReceived += float64(len(event.Event))
-		esStat.endTime = time.Now()
-		if event.Event[:9] == "---end---" {
-			generatedCount, err := strconv.ParseInt(event.Event[10:], 10, 64)
-			if err != nil {
-				log.Fatalln(err)
-			}
-			esStat.generatedCount = generatedCount
-		}
-	}
-
-	resp.WriteHeader(http.StatusAccepted)
-	resp.Write(okRespBody)
 }
 
 func (r *splunkReceiver) failRequest(
@@ -266,6 +251,5 @@ func initJSONResponse(s string) []byte {
 
 func main() {
 	r, _ := NewLogsReceiver()
-	log.Println("start")
 	r.Start()
 }
