@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hec-receiver-mock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hec-receiver-mock
+  template:
+    metadata:
+      labels:
+        app: hec-receiver-mock
+    spec:
+      containers:
+        - name: hec-receiver-mock
+          image: rock1017/hec-receiver-mock:0.1.0
+          ports:
+            - containerPort: 8088
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hec-receiver-mock
+  labels:
+    run: hec-receiver-mock
+spec:
+  ports:
+    - port: 8088
+      protocol: TCP
+  selector:
+    app: hec-receiver-mock
