@@ -201,7 +201,7 @@ func (r *splunkReceiver) calculateStats() *[]summaryData {
 			Source:         source,
 			Eps:            fmt.Sprintf("%0.f", float64(stats.eventsReceived)/stats.endTime.Sub(stats.beginTime).Seconds()),
 			Thorughput:     fmt.Sprintf("%0.fk", stats.bytesReceived/1024),
-			DataIngestRate: fmt.Sprintf("%2.f%", float64(stats.eventsReceived)/float64(stats.generatedCount)*100),
+			DataIngestRate: fmt.Sprintf("%0.f%%", float64(stats.eventsReceived)/float64(stats.generatedCount)*100),
 			EventsReceived: stats.eventsReceived,
 		}
 		result = append(result, sum)
